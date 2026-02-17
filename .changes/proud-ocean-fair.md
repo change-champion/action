@@ -1,5 +1,0 @@
----
-type: major
----
-
-Initial release
