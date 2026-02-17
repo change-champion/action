@@ -1,4 +1,4 @@
-name: 'Change Champion Action'
+name: 'Change Champion Release Action'
 description: 'Create release PRs and publish tags using change-champion'
 author: 'Offload Project'
 
