@@ -1,0 +1,12 @@
+{
+  "name": "change-champion/action",
+  "description": "GitHub Action for automating releases with Change Champion",
+  "type": "project",
+  "license": "MIT",
+  "homepage": "https://github.com/change-champion/action",
+  "authors": [
+    {
+      "name": "Offload Project"
+    }
+  ]
+}

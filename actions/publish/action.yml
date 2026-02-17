@@ -1,0 +1,133 @@
+name: 'Change Champion Publish'
+description: 'Create a git tag and GitHub Release from the latest changelog entry'
+author: 'Change Champion'
+
+inputs:
+  token:
+    description: 'GitHub token for creating tags and releases'
+    required: false
+    default: ${{ github.token }}
+  create-tag:
+    description: 'Whether to create and push a git tag'
+    required: false
+    default: 'true'
+  create-release:
+    description: 'Whether to create a GitHub Release'
+    required: false
+    default: 'true'
+
+outputs:
+  published:
+    description: 'Whether a release was published (tag was created and pushed)'
+    value: ${{ steps.tag.outputs.published || 'false' }}
+  version:
+    description: 'The version that was released'
+    value: ${{ steps.version.outputs.version }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Read config
+      id: config
+      shell: bash
+      run: |
+        if [ -f .changes/config.json ]; then
+          DRAFT=$(jq -r '.draftRelease // false' .changes/config.json 2>/dev/null || echo "false")
+          VERSION_PREFIX=$(jq -r '.versionPrefix // "v"' .changes/config.json 2>/dev/null || echo "v")
+        else
+          DRAFT="false"
+          VERSION_PREFIX="v"
+        fi
+        echo "draftRelease=$DRAFT" >> $GITHUB_OUTPUT
+        echo "versionPrefix=$VERSION_PREFIX" >> $GITHUB_OUTPUT
+
+    - name: Get version from CHANGELOG
+      id: version
+      shell: bash
+      run: |
+        VERSION=$(grep -m1 -oP '^## \[?v?\K[0-9]+\.[0-9]+\.[0-9]+' CHANGELOG.md)
+
+        if [ -z "$VERSION" ]; then
+          echo "::error::Failed to parse version from CHANGELOG.md"
+          exit 1
+        fi
+
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+    - name: Configure git credentials
+      shell: bash
+      env:
+        TOKEN: ${{ inputs.token }}
+      run: |
+        git config --local url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
+
+    - name: Check if tag exists
+      id: check-tag
+      shell: bash
+      run: |
+        TAG="${{ steps.config.outputs.versionPrefix }}${{ steps.version.outputs.version }}"
+        if git ls-remote --tags origin "refs/tags/$TAG" | grep -q "$TAG"; then
+          echo "exists=true" >> $GITHUB_OUTPUT
+        else
+          echo "exists=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Create and push tag
+      if: inputs.create-tag == 'true' && steps.check-tag.outputs.exists == 'false'
+      id: tag
+      shell: bash
+      run: |
+        TAG="${{ steps.config.outputs.versionPrefix }}${{ steps.version.outputs.version }}"
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git tag -a "$TAG" -m "Release $TAG"
+        git push origin "$TAG"
+        echo "published=true" >> $GITHUB_OUTPUT
+
+    - name: Skip tag creation
+      if: inputs.create-tag == 'true' && steps.check-tag.outputs.exists == 'true'
+      shell: bash
+      run: echo "::warning::Tag ${{ steps.config.outputs.versionPrefix }}${{ steps.version.outputs.version }} already exists on remote, skipping tag creation"
+
+    - name: Create GitHub Release
+      if: inputs.create-release == 'true' && (steps.tag.outputs.published == 'true' || steps.check-tag.outputs.exists == 'true')
+      uses: actions/github-script@v8
+      with:
+        github-token: ${{ inputs.token }}
+        script: |
+          const version = '${{ steps.version.outputs.version }}';
+          const tag = '${{ steps.config.outputs.versionPrefix }}' + version;
+          const fs = require('fs');
+
+          let changelog = `Release ${tag}`;
+          try {
+            const content = fs.readFileSync('CHANGELOG.md', 'utf8');
+            const regex = new RegExp(`## \\[?v?${version}[\\s\\S]*?(?=## \\[?v?\\d|$)`);
+            const match = content.match(regex);
+            if (match) changelog = match[0].trim();
+          } catch (e) {}
+
+          const draftRelease = '${{ steps.config.outputs.draftRelease }}' === 'true';
+
+          // Check if release already exists
+          try {
+            await github.rest.repos.getReleaseByTag({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag: tag
+            });
+            core.warning(`GitHub Release for ${tag} already exists, skipping`);
+            return;
+          } catch (e) {
+            // Release doesn't exist, create it
+          }
+
+          await github.rest.repos.createRelease({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            tag_name: tag,
+            name: tag,
+            body: changelog,
+            draft: draftRelease,
+            prerelease: false
+          });

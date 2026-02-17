@@ -1,0 +1,356 @@
+name: 'Change Champion Action'
+description: 'Create release PRs and publish tags using change-champion'
+author: 'Offload Project'
+
+branding:
+  icon: 'package'
+  color: 'red'
+
+inputs:
+  php-version:
+    description: 'PHP version to use'
+    required: false
+    default: '8.2'
+  version:
+    description: 'Version of change-champion to use'
+    required: false
+    default: 'latest'
+  check:
+    description: 'Whether to check for changesets on pull requests and post a comment if missing'
+    required: false
+    default: 'true'
+  publish:
+    description: 'Deprecated: use create-tag and create-release instead. Controls both tag and release creation.'
+    required: false
+    default: 'true'
+  create-tag:
+    description: 'Whether to create and push a git tag when release PR is merged'
+    required: false
+    default: 'true'
+  create-release:
+    description: 'Whether to create a GitHub Release when release PR is merged'
+    required: false
+    default: 'true'
+  token:
+    description: 'GitHub token for creating PRs and releases'
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  published:
+    description: 'Whether a release was published'
+    value: ${{ steps.tag.outputs.published || 'false' }}
+  version:
+    description: 'The released version on publish runs, or the next version for the release PR on push runs'
+    value: ${{ steps.publish-version.outputs.version || steps.changesets.outputs.version || '' }}
+  hasChangesets:
+    description: 'Whether there are pending changesets'
+    value: ${{ steps.changesets.outputs.hasChangesets || 'false' }}
+  pullRequestNumber:
+    description: 'The pull request number if one was created'
+    value: ${{ steps.pr.outputs.pull-request-number || '' }}
+
+runs:
+  using: 'composite'
+  steps:
+    # ── Shared: read config and detect event ──
+
+    - name: Read config
+      id: config
+      shell: bash
+      run: |
+        if [ -f .changes/config.json ]; then
+          RELEASE_PREFIX=$(jq -r '.releaseBranchPrefix // "release/"' .changes/config.json 2>/dev/null || echo "release/")
+          VERSION_PREFIX=$(jq -r '.versionPrefix // "v"' .changes/config.json 2>/dev/null || echo "v")
+          DRAFT=$(jq -r '.draftRelease // false' .changes/config.json 2>/dev/null || echo "false")
+        else
+          RELEASE_PREFIX="release/"
+          VERSION_PREFIX="v"
+          DRAFT="false"
+        fi
+        echo "releaseBranchPrefix=$RELEASE_PREFIX" >> $GITHUB_OUTPUT
+        echo "versionPrefix=$VERSION_PREFIX" >> $GITHUB_OUTPUT
+        echo "draftRelease=$DRAFT" >> $GITHUB_OUTPUT
+
+    - name: Detect event type
+      id: detect
+      shell: bash
+      run: |
+        if [[ "${{ github.event_name }}" == "pull_request" && "${{ github.event.pull_request.merged }}" == "true" ]]; then
+          HEAD_REF="${{ github.event.pull_request.head.ref }}"
+          PREFIX="${{ steps.config.outputs.releaseBranchPrefix }}"
+          if [[ "$HEAD_REF" == ${PREFIX}* ]]; then
+            echo "type=release-merge" >> $GITHUB_OUTPUT
+          else
+            echo "type=pr-merge" >> $GITHUB_OUTPUT
+          fi
+        elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
+          echo "type=pr-open" >> $GITHUB_OUTPUT
+        else
+          echo "type=push" >> $GITHUB_OUTPUT
+        fi
+
+    # ── Check: comment on PRs missing changesets ──
+
+    - name: Check if release PR
+      if: inputs.check == 'true' && steps.detect.outputs.type == 'pr-open'
+      id: release-check
+      shell: bash
+      run: |
+        HEAD_REF="${{ github.head_ref }}"
+        PREFIX="${{ steps.config.outputs.releaseBranchPrefix }}"
+        if [[ "$HEAD_REF" == ${PREFIX}* ]]; then
+          echo "is_release=true" >> $GITHUB_OUTPUT
+        else
+          echo "is_release=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Fetch base ref
+      if: inputs.check == 'true' && steps.detect.outputs.type == 'pr-open' && steps.release-check.outputs.is_release == 'false'
+      shell: bash
+      run: git fetch origin ${{ github.base_ref }} --depth=1
+
+    - name: Check for changeset files
+      if: inputs.check == 'true' && steps.detect.outputs.type == 'pr-open' && steps.release-check.outputs.is_release == 'false'
+      id: changeset-check
+      shell: bash
+      run: |
+        if ! CHANGED_FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD 2>&1); then
+          echo "::warning::Could not compute diff against origin/${{ github.base_ref }}: $CHANGED_FILES"
+          echo "has_changeset=unknown" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        CHANGESET_FILES=$(echo "$CHANGED_FILES" | grep -E '^\.changes/.*\.md$' | grep -v 'README.md' || true)
+
+        if [ -z "$CHANGESET_FILES" ]; then
+          echo "has_changeset=false" >> $GITHUB_OUTPUT
+        else
+          echo "has_changeset=true" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Comment on PR
+      if: steps.changeset-check.outputs.has_changeset == 'false'
+      uses: actions/github-script@v8
+      continue-on-error: true
+      with:
+        github-token: ${{ inputs.token }}
+        script: |
+          const body = `### 📝 No Changeset Found
+
+          This PR does not include a changeset. If this change should be included in the changelog and trigger a release, please add one:
+
+          \`\`\`bash
+          champ add
+          \`\`\`
+
+          If this change doesn't need a release (e.g., docs, tests, CI), you can ignore this message.
+
+          <details>
+          <summary>What is a changeset?</summary>
+
+          A changeset is a markdown file in the \`.changes/\` directory that describes what changed and how it affects the version number (major, minor, or patch).
+
+          </details>`;
+
+          const { data: comments } = await github.rest.issues.listComments({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+          });
+
+          const botComment = comments.find(comment =>
+            comment.user.type === 'Bot' &&
+            comment.body.includes('No Changeset Found')
+          );
+
+          if (!botComment) {
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body
+            });
+          }
+
+    # ── Version: process changesets and create release PR ──
+
+    - name: Setup PHP
+      if: steps.detect.outputs.type == 'push' || steps.detect.outputs.type == 'pr-merge'
+      uses: shivammathur/setup-php@v2
+      with:
+        php-version: ${{ inputs.php-version }}
+        tools: composer:v2
+
+    - name: Install change-champion
+      if: steps.detect.outputs.type == 'push' || steps.detect.outputs.type == 'pr-merge'
+      shell: bash
+      run: |
+        composer global require change-champion/champ:${{ inputs.version == 'latest' && '*' || inputs.version }}
+        echo "$(composer global config bin-dir --absolute)" >> $GITHUB_PATH
+
+    - name: Check for changesets
+      if: steps.detect.outputs.type == 'push' || steps.detect.outputs.type == 'pr-merge'
+      id: changesets
+      shell: bash
+      run: |
+        if ! STATUS=$(champ status 2>&1); then
+          if echo "$STATUS" | grep -q "No pending changesets"; then
+            echo "hasChangesets=false" >> $GITHUB_OUTPUT
+            echo "No changesets found"
+            exit 0
+          fi
+          echo "::error::champ status failed: $STATUS"
+          exit 1
+        fi
+
+        if echo "$STATUS" | grep -q "No pending changesets"; then
+          echo "hasChangesets=false" >> $GITHUB_OUTPUT
+          echo "No changesets found"
+        else
+          echo "hasChangesets=true" >> $GITHUB_OUTPUT
+          VERSION=$(echo "$STATUS" | grep "Next version:" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+
+          if [ -z "$VERSION" ]; then
+            echo "::error::Failed to parse next version from champ status output: $STATUS"
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Found changesets, next version: $VERSION"
+
+          echo "y" | champ version
+        fi
+
+    - name: Remove checkout credentials
+      if: steps.changesets.outputs.hasChangesets == 'true'
+      shell: bash
+      run: |
+        git config --unset-all http.https://github.com/.extraheader || true
+
+    - name: Create Pull Request
+      if: steps.changesets.outputs.hasChangesets == 'true'
+      id: pr
+      uses: peter-evans/create-pull-request@v8
+      with:
+        token: ${{ inputs.token }}
+        base: ${{ github.event.repository.default_branch }}
+        commit-message: 'chore: release ${{ steps.config.outputs.versionPrefix }}${{ steps.changesets.outputs.version }}'
+        title: 'chore: release ${{ steps.config.outputs.versionPrefix }}${{ steps.changesets.outputs.version }}'
+        body: |
+          ## Release ${{ steps.config.outputs.versionPrefix }}${{ steps.changesets.outputs.version }}
+
+          This PR was automatically created by change-champion.
+
+          ### Next Steps
+          1. Review the changes
+          2. Merge this PR
+          3. The release will be tagged automatically
+
+          ---
+          🤖 Generated by [change-champion](https://github.com/change-champion/champ)
+        branch: ${{ steps.config.outputs.releaseBranchPrefix }}${{ steps.config.outputs.versionPrefix }}${{ steps.changesets.outputs.version }}
+        delete-branch: true
+        labels: |
+          release
+          automated
+
+    # ── Publish: create tag and GitHub Release ──
+
+    - name: Get version from CHANGELOG
+      if: steps.detect.outputs.type == 'release-merge'
+      id: publish-version
+      shell: bash
+      run: |
+        VERSION=$(grep -m1 -oP '^## \[?v?\K[0-9]+\.[0-9]+\.[0-9]+' CHANGELOG.md)
+
+        if [ -z "$VERSION" ]; then
+          echo "::error::Failed to parse version from CHANGELOG.md"
+          exit 1
+        fi
+
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+    - name: Configure git credentials
+      if: steps.detect.outputs.type == 'release-merge'
+      shell: bash
+      env:
+        TOKEN: ${{ inputs.token }}
+      run: |
+        git config --local url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
+
+    - name: Check if tag exists
+      if: steps.detect.outputs.type == 'release-merge'
+      id: check-tag
+      shell: bash
+      run: |
+        TAG="${{ steps.config.outputs.versionPrefix }}${{ steps.publish-version.outputs.version }}"
+        if git ls-remote --tags origin "refs/tags/$TAG" | grep -q "$TAG"; then
+          echo "exists=true" >> $GITHUB_OUTPUT
+        else
+          echo "exists=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Create and push tag
+      if: steps.detect.outputs.type == 'release-merge' && inputs.publish != 'false' && inputs.create-tag == 'true' && steps.check-tag.outputs.exists == 'false'
+      id: tag
+      shell: bash
+      run: |
+        TAG="${{ steps.config.outputs.versionPrefix }}${{ steps.publish-version.outputs.version }}"
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git tag -a "$TAG" -m "Release $TAG"
+        git push origin "$TAG"
+        echo "published=true" >> $GITHUB_OUTPUT
+
+    - name: Skip tag creation
+      if: steps.detect.outputs.type == 'release-merge' && inputs.create-tag == 'true' && steps.check-tag.outputs.exists == 'true'
+      shell: bash
+      run: echo "::warning::Tag ${{ steps.config.outputs.versionPrefix }}${{ steps.publish-version.outputs.version }} already exists on remote, skipping tag creation"
+
+    - name: Create GitHub Release
+      if: >
+        steps.detect.outputs.type == 'release-merge' &&
+        inputs.publish != 'false' &&
+        inputs.create-release == 'true' &&
+        (steps.tag.outputs.published == 'true' || steps.check-tag.outputs.exists == 'true')
+      uses: actions/github-script@v8
+      with:
+        github-token: ${{ inputs.token }}
+        script: |
+          const version = '${{ steps.publish-version.outputs.version }}';
+          const tag = '${{ steps.config.outputs.versionPrefix }}' + version;
+          const fs = require('fs');
+
+          let changelog = `Release ${tag}`;
+          try {
+            const content = fs.readFileSync('CHANGELOG.md', 'utf8');
+            const regex = new RegExp(`## \\[?v?${version}[\\s\\S]*?(?=## \\[?v?\\d|$)`);
+            const match = content.match(regex);
+            if (match) changelog = match[0].trim();
+          } catch (e) {}
+
+          const draftRelease = '${{ steps.config.outputs.draftRelease }}' === 'true';
+
+          // Check if release already exists
+          try {
+            await github.rest.repos.getReleaseByTag({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag: tag
+            });
+            core.warning(`GitHub Release for ${tag} already exists, skipping`);
+            return;
+          } catch (e) {
+            // Release doesn't exist, create it
+          }
+
+          await github.rest.repos.createRelease({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            tag_name: tag,
+            name: tag,
+            body: changelog,
+            draft: draftRelease,
+            prerelease: false
+          });

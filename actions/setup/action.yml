@@ -1,0 +1,28 @@
+name: 'Change Champion Setup'
+description: 'Setup PHP and install change-champion CLI'
+author: 'Change Champion'
+
+inputs:
+  php-version:
+    description: 'PHP version to use'
+    required: false
+    default: '8.2'
+  version:
+    description: 'Version of change-champion to install'
+    required: false
+    default: 'latest'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup PHP
+      uses: shivammathur/setup-php@v2
+      with:
+        php-version: ${{ inputs.php-version }}
+        tools: composer:v2
+
+    - name: Install change-champion
+      shell: bash
+      run: |
+        composer global require change-champion/champ:${{ inputs.version == 'latest' && '*' || inputs.version }}
+        echo "$(composer global config bin-dir --absolute)" >> $GITHUB_PATH
